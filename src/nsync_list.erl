@@ -24,7 +24,7 @@
 -export([command_hooks/0, handle/3]).
 
 command_hooks() ->
-    ["lpush", "lpop", "rpush", "rpop"].
+    ["lpush", "lpop", "lrem", "rpush", "rpop"].
 
 handle("lpush", [Key, Val], Tid) ->
     List = lookup(Tid, Key),
@@ -37,6 +37,10 @@ handle("lpop", [Key], Tid) ->
         _ ->
             ok
     end;
+
+handle("lrem", [Key, Count, Val], Tid) ->
+    List = lookup(Tid, Key),
+    ets:insert(Tid, {Key, delete(Val, list_to_integer(binary_to_list(Count)), List)});
 
 handle("rpush", [Key, Val], Tid) ->
     List = lookup(Tid, Key),
@@ -56,3 +60,20 @@ lookup(Tid, Key) ->
         [] -> []
     end.
 
+delete(Elem, Count, List) when Count > 0 ->
+    delete(Elem, Count, List, [], 0);
+delete(Elem, Count, List) when Count < 0 ->
+    lists:reverse(delete(Elem, Count * -1, lists:reverse(List), [], 0));
+delete(Elem, _Count, List) ->
+    delete(Elem, all, List, [], 0).
+
+delete(_Elem, _Max, [], Acc, _Inc) ->
+    lists:reverse(Acc);
+delete(_Elem, Max, List, Acc, Max) ->
+    lists:reverse(Acc) ++ List;
+delete(Elem, Max, [Elem | T], Acc, Inc) ->
+    delete(Elem, Max, T, Acc, Inc + 1);
+delete(Elem, Max, [H | T], Acc, Inc) ->
+    delete(Elem, Max, T, [H | Acc], Inc).
+
+    
