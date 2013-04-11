@@ -40,6 +40,11 @@
                 state, buffer, rdb_state}).
 
 -define(TIMEOUT, 30000).
+%% By default, redis should send us a PING message roughly every second
+%% even with data flowing through. If this fails to happen and we receive
+%% no data whatsoever in over a minute, we can assume something went wrong.
+-define(HEARTBEAT, 60000). % 1 minute
+
 -define(CALLBACK_MODS, [nsync_string,
                         nsync_list,
                         nsync_set,
@@ -77,17 +82,17 @@ start_link(Opts) ->
 %%====================================================================
 init([Opts, CallerPid]) ->
     case init_state(Opts, CallerPid) of
-        {ok, State} ->
-            {ok, State};
+        {ok, State = #state{}} ->
+            {ok, State, ?HEARTBEAT};
         Error ->
             {stop, Error}
     end.
 
-handle_call(_Request, _From, State) ->
-    {reply, ignore, State}.
+handle_call(_Request, _From, State = #state{}) ->
+    {reply, ignore, State, ?HEARTBEAT}.
 
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+handle_cast(_Msg, State = #state{}) ->
+    {noreply, State, ?HEARTBEAT}.
 
 handle_info({tcp, Socket, Data}, #state{callback=Callback,
                                         caller_pid=CallerPid,
@@ -113,14 +118,20 @@ handle_info({tcp, Socket, Data}, #state{callback=Callback,
                 State#state{rdb_state=RdbState1}
         end,
     inet:setopts(Socket, [{active, once}]),
-    {noreply, NewState};
+    {noreply, NewState, ?HEARTBEAT};
+
+%% We received the heartbeat, keep going!
+handle_info({tcp, Socket, <<"+PONG\r\n">>}, #state{socket=Socket,
+                                                   state=heartbeat}=State) ->
+    inet:setopts(Socket, [{active, once}]),
+    {noreply, State#state{state=up}, ?HEARTBEAT};
 
 handle_info({tcp, Socket, Data}, #state{callback=Callback,
                                         socket=Socket,
                                         buffer=Buffer}=State) ->
     {ok, Rest} = redis_text_proto:parse_commands(<<Buffer/binary, Data/binary>>, Callback),
     inet:setopts(Socket, [{active, once}]),
-    {noreply, State#state{buffer=Rest}};
+    {noreply, State#state{buffer=Rest}, ?HEARTBEAT};
 
 handle_info({tcp_closed, _}, #state{callback=Callback,
                                     opts=Opts,
@@ -129,7 +140,7 @@ handle_info({tcp_closed, _}, #state{callback=Callback,
     nsync_utils:do_callback(Callback, [{error, closed}]),
     case reconnect(Opts) of
         {ok, State1} ->
-            {noreply, State1};
+            {noreply, State1, ?HEARTBEAT};
         Error ->
             {stop, Error, State}
     end;
@@ -141,19 +152,43 @@ handle_info({tcp_error, _ ,_}, #state{callback=Callback,
     nsync_utils:do_callback(Callback, [{error, closed}]),
     case reconnect(Opts) of    
         {ok, State1} ->
-            {noreply, State1};
+            {noreply, State1, ?HEARTBEAT};
         Error ->
             {stop, Error, State}
     end;
 
-handle_info(_Info, State) ->
-    {noreply, State}.
+%% Heartbeat timer is off and we were loading data. Not normal.
+handle_info(timeout, State = #state{state=loading}) ->
+    {stop, rdb_load_timeout, State};
+
+%% Heartbeat timer is off while streaming data. The connection probably
+%% has something wrong with it. We send an inline PING command, which should
+%% have the server sending us a +PONG response back in a packet.
+handle_info(timeout, State = #state{state=up, socket=Socket}) ->
+    gen_tcp:send(Socket, <<"PING\r\n">>),
+    {noreply, State#state{state=heartbeat}, ?HEARTBEAT};
+
+%% The heartbeat timed out. Assume the connection is broken.
+handle_info(timeout, State = #state{state=heartbeat, socket=Socket,
+                                    callback=Callback, opts=Opts}) ->
+    catch gen_tcp:close(Socket),
+    nsync_utils:do_callback(Callback, [{error, closed}]),
+    case reconnect(Opts) of
+        {ok, State1} ->
+            {noreply, State1, ?HEARTBEAT};
+        Error ->
+            ct:pal("Error: ~p",[Error]),
+            {stop, Error, State}
+    end;
+
+handle_info(_Info, State = #state{}) ->
+    {noreply, State, ?HEARTBEAT}.
 
 terminate(_Reason, _State) ->
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    {ok, State, ?HEARTBEAT}.
 
 %%====================================================================
 %% internal functions
@@ -216,6 +251,8 @@ authenticate(Socket, Auth) ->
                     ok;
                 {ok, <<"+OK\r\n">>} ->
                     ok;
+                {ok, Other} ->
+                    {error, {ok, Other}};
                 Error ->
                     Error
             end;
