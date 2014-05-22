@@ -204,13 +204,8 @@ rdb_len(<<Type, Rest/binary>>) ->
             end;
         _ ->
             case Rest of
-                <<Next:3, Rest1/binary>> ->
-                    case <<Type, Next/binary>> of
-                        <<Val:4/unsigned-integer>> ->
-                            {ok, false, Val, Rest1};
-                        _ ->
-                            exit({error, eof})
-                    end;
+                <<Val:4/unsigned-integer-unit:8, Rest1/binary>> ->
+                    {ok, false, Val, Rest1};
                 _ ->
                     exit({error, eof})
             end
