@@ -25,7 +25,7 @@
          ,load_file/2
         ]).
 
--record(state, {first = true, buffer = <<>>}).
+-record(state, {first = true, buffer = <<>>,vsn = undefined}).
 
 -include("nsync.hrl").
 
@@ -52,7 +52,7 @@ packet(State, Data, Callback) when State == undefined orelse State#state.first =
                             lists:member(Vsn, [<<"0001">>,<<"0002">>,<<"0003">>,
                                                <<"0004">>,<<"0005">>,<<"0006">>])
                              orelse exit({error, vsn_not_supported}),
-                            packet(#state{buffer = <<>>, first = false}, Rest2, Callback);
+                            packet(#state{buffer = <<>>, first = false,vsn = binary_to_integer(Vsn)}, Rest2, Callback);
                         {error, eof} ->
                             #state{buffer = Data}
                     end;
@@ -63,10 +63,14 @@ packet(State, Data, Callback) when State == undefined orelse State#state.first =
             #state{buffer = Data}
     end;
 
-packet(#state{buffer=Buffer}, Data, Callback) ->
+packet(#state{buffer=Buffer, vsn = Vsn}, Data, Callback) ->
     case parse(<<Buffer/binary, Data/binary>>, Callback) of
         {ok, Rest} ->
             #state{buffer = Rest, first = false};
+        {eof, <<_CRC:8/binary,Rest/binary>>} when Vsn >= 5 ->
+            {eof, Rest};
+        {eof, _} when Vsn >= 5 ->
+            {error,eof};
         {eof, Rest} ->
             {eof, Rest}
     end.
@@ -200,13 +204,8 @@ rdb_len(<<Type, Rest/binary>>) ->
             end;
         _ ->
             case Rest of
-                <<Next:3, Rest1/binary>> ->
-                    case <<Type, Next/binary>> of
-                        <<Val:4/unsigned-integer>> ->
-                            {ok, false, Val, Rest1};
-                        _ ->
-                            exit({error, eof})
-                    end;
+                <<Val:4/unsigned-integer-unit:8, Rest1/binary>> ->
+                    {ok, false, Val, Rest1};
                 _ ->
                     exit({error, eof})
             end
